@@ -5,9 +5,23 @@ name: Docker
 # separate terms of service, privacy policy, and support
 # documentation.
 
+# Each 8.* branch is a PHP flavor (8.2, 8.3, 8.3-alpine, ...) and is published
+# as ghcr.io/<owner>/php:<branch>. Branches whose Dockerfile has an
+# `ARG ROOTLESS` also get a ghcr.io/<owner>/php:<branch>-rootless variant.
+#
+# Scheduled runs only execute the workflow file on the default branch, so the
+# schedule and workflow_dispatch triggers rebuild every 8.* branch from there.
+# Push and pull_request runs build just the branch they were triggered on.
+
 on:
   schedule:
     - cron: '0 4 * * 3'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (blank for every 8.* branch)'
+        required: false
+        default: ''
   push:
     branches:
       - '8.*'
@@ -22,8 +36,74 @@ env:
   IMAGE_NAME: "${{ github.repository_owner }}/php"
 
 jobs:
-  build:
+  matrix:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # One entry per branch, plus a -rootless entry for branches that support it.
+      - name: Compute build matrix
+        id: matrix
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            push)         branches="$REF_NAME" ;;
+            pull_request) branches="$BASE_REF" ;;
+            *)
+              if [ -n "$INPUT_BRANCH" ]; then
+                branches="$INPUT_BRANCH"
+              else
+                branches="$(git for-each-ref --format='%(refname:strip=3)' 'refs/remotes/origin/8.*')"
+              fi
+              ;;
+          esac
+
+          include='[]'
+          for branch in $branches; do
+            # Push and PR builds use the triggering commit, scheduled builds the branch tip.
+            if [ "$EVENT" = push ] || [ "$EVENT" = pull_request ]; then
+              ref="$GITHUB_SHA"
+              rev="$GITHUB_SHA"
+            else
+              ref="$branch"
+              rev="origin/$branch"
+            fi
+
+            dockerfile="$(git show "$rev:Dockerfile")"
+            if grep -q '^ARG ROOTLESS=' <<< "$dockerfile"; then
+              entries="$(jq -nc --arg b "$branch" --arg r "$ref" '[
+                {branch: $b, ref: $r, variant: "default",  suffix: "",          build_args: "ROOTLESS=false"},
+                {branch: $b, ref: $r, variant: "rootless", suffix: "-rootless", build_args: "ROOTLESS=true"}
+              ]')"
+            else
+              entries="$(jq -nc --arg b "$branch" --arg r "$ref" '[
+                {branch: $b, ref: $r, variant: "default", suffix: "", build_args: ""}
+              ]')"
+            fi
+            include="$(jq -nc --argjson a "$include" --argjson b "$entries" '$a + $b')"
+          done
+
+          echo "matrix=$(jq -nc --argjson i "$include" '{include: $i}')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: matrix
+    runs-on: ubuntu-latest
+    name: build (${{ matrix.branch }}${{ matrix.suffix }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
     permissions:
       contents: read
       packages: write
@@ -34,6 +114,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
 
       # Install the cosign tool except on PR
       # https://github.com/sigstore/cosign-installer
@@ -59,6 +141,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Get checked-out revision
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
       - name: Extract Docker metadata
@@ -66,8 +152,14 @@ jobs:
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=${{ matrix.suffix }}
+          # The tag comes from the matrix, not the event ref, because scheduled
+          # runs build every branch from the default branch's context.
           tags: |
-            type=ref,event=branch
+            type=raw,value=${{ matrix.branch }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
 
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
@@ -79,8 +171,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=${{ matrix.branch }}${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.branch }}${{ matrix.suffix }}
 
       # Sign the resulting Docker image digest except on PRs.
       # This will only write to the public Rekor transparency log when the Docker
