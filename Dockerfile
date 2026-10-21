@@ -35,13 +35,24 @@ RUN docker-php-ext-install -j$(nproc) \
     exif \
     gmp
 
-RUN pecl install redis \
-    && docker-php-ext-enable redis
-
-# install xdebug but leave it off by default (configured in entrypoint)
-RUN pecl install xdebug \
-    && docker-php-ext-enable xdebug \
-    && docker-php-source delete
+# pecl.php.net intermittently returns 504s to CI runners, so retry downloads
+RUN set -eux; \
+    pecl_install() { \
+        n=0; \
+        until pecl install "$1"; do \
+            n=$((n + 1)); \
+            [ "$n" -lt 5 ] || return 1; \
+            sleep $((n * 10)); \
+        done; \
+    }; \
+    \
+    pecl_install redis; \
+    docker-php-ext-enable redis; \
+    \
+    # install xdebug but leave it off by default (configured in entrypoint)
+    pecl_install xdebug; \
+    docker-php-ext-enable xdebug; \
+    docker-php-source delete
 
 # ---- install core extensions required by IPB 4.7 ----
 RUN echo "memory_limit=256M" >> /usr/local/etc/php/conf.d/custom.ini \
@@ -51,5 +62,18 @@ RUN echo "memory_limit=256M" >> /usr/local/etc/php/conf.d/custom.ini \
   && echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/custom.ini \
   && printf "\n[www]\nrequest_terminate_timeout = 300\n" >> /usr/local/etc/php-fpm.d/zz-timeouts.conf
 
+# Run FPM workers as root when ROOTLESS=true. Rootless Docker maps container
+# root to the host user, so files written to the bind mount (config.php,
+# cache/, files/) stay owned by and editable by the host user.
+# Dev only. Defaults to false, which keeps the image's www-data workers; CI
+# publishes this variant as the <branch>-rootless tag.
+ARG ROOTLESS=false
+RUN if [ "$ROOTLESS" = "true" ]; then \
+        printf '%s\n' '[www]' 'user = root' 'group = root' \
+            > /usr/local/etc/php-fpm.d/zz-user.conf; \
+    fi
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["php-fpm"]
+# --allow-to-run-as-root is only needed when the pool user is root
+# (ROOTLESS=true) and is a no-op otherwise.
+CMD ["php-fpm", "--allow-to-run-as-root"]
