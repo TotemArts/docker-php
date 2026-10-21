@@ -44,10 +44,19 @@ RUN set -eux; \
         exif \
         gmp; \
     \
-    pecl install redis; \
+    pecl_install() { \
+        n=0; \
+        until pecl install "$1"; do \
+            n=$((n + 1)); \
+            [ "$n" -lt 5 ] || return 1; \
+            sleep $((n * 10)); \
+        done; \
+    }; \
+    \
+    pecl_install redis; \
     docker-php-ext-enable redis; \
     \
-    pecl install xdebug; \
+    pecl_install xdebug; \
     docker-php-ext-enable xdebug; \
     \
     docker-php-source delete; \
