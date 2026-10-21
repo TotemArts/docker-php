@@ -66,5 +66,19 @@ RUN set -eux; \
     printf '[www]\nrequest_terminate_timeout = 300\n' \
         > /usr/local/etc/php-fpm.d/zz-timeouts.conf
 
+# Run FPM workers as root when ROOTLESS=true (the default). Rootless Docker maps
+# container root to the host user, so files written to the bind mount
+# (config.php, cache/, files/) stay owned by and editable by the host user.
+# Dev only. Build with ROOTLESS=false on regular (rootful) Docker to keep the
+# image's default www-data workers instead.
+ARG ROOTLESS=true
+RUN if [ "$ROOTLESS" = "true" ]; then \
+        printf '%s\n' '[www]' 'user = root' 'group = root' \
+            > /usr/local/etc/php-fpm.d/zz-user.conf; \
+    fi
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["php-fpm"]
+# Rootless Docker: container root is the host user, so running the
+# workers as root keeps files in the bind mount owned by you. The flag is
+# a no-op when the pool user is www-data (ROOTLESS=false).
+CMD ["php-fpm", "--allow-to-run-as-root"]
