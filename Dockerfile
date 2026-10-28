@@ -6,10 +6,12 @@ RUN apk add --no-cache \
     freetype \
     gmp \
     icu-libs \
+    imagemagick \
     libjpeg-turbo \
     libpng \
     libxml2 \
     libzip \
+    lua5.1 \
     postgresql-libs \
     zip \
     unzip
