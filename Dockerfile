@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y \
     unzip \
     libgmp-dev \
     libpq-dev \
+    lua5.1 \
+    imagemagick \
     $PHPIZE_DEPS \
     && rm -rf /var/lib/apt/lists/*
 
